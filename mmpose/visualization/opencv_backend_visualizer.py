@@ -131,13 +131,14 @@ class OpencvBackendVisualizer(Visualizer):
             if isinstance(face_colors, str):
                 face_colors = mmcv.color_val(face_colors)[::-1]
 
+            radius = int(np.asarray(radius).item())
             if alpha == 1.0:
                 self._image = cv2.circle(self._image,
                                          (int(center[0]), int(center[1])),
-                                         int(radius), face_colors, -1)
+                                         radius, face_colors, -1)
             else:
                 img = cv2.circle(self._image.copy(),
-                                 (int(center[0]), int(center[1])), int(radius),
+                                 (int(center[0]), int(center[1])), radius,
                                  face_colors, -1)
                 self._image = cv2.addWeighted(self._image, 1 - alpha, img,
                                               alpha, 0)
