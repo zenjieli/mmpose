@@ -6,6 +6,32 @@ Usage:
         --bbox xmin ymin xmax ymax \
         [--checkpoint work_dirs/rtmpose-t_pascal3d_car/best_coco_AP_epoch_380.pth] \
         [--out output.png]
+
+Inference pipeline
+------------------
+The model was trained on Pascal3D+ images (~500px) where cars fill a large
+fraction of the frame.  On high-resolution video frames (e.g. 1920x1080),
+passing the tight detection bbox directly produces poor results because the
+car occupies only a tiny fraction of the warped 192x256 input.
+
+To match the training distribution we:
+
+  1. Crop the image around the detection bbox with 30% margin on each side.
+     This produces a ~500px crop where the car fills most of the area,
+     similar to Pascal3D+ training images.
+  2. Pass the *entire crop* as the bbox to the model (bbox=[0,0,cw,ch]).
+     The model's GetBBoxCenterScale + TopdownAffine pipeline then
+     uniformly scales the whole crop to 192x256 (with black borders for
+     aspect-ratio adjustment).
+
+This differs from training where the pipeline receives a tight detection bbox
+and GetBBoxCenterScale's 1.25x padding adds real image context around the car.
+Here the 30% crop margin provides that context upfront, and the 1.25x padding
+extends into zero-filled (black) regions instead.  The model is robust to this
+difference because the car is already at a similar scale to training.
+
+Predicted keypoints are offset by the crop origin to return coordinates in the
+original image frame.
 """
 
 import argparse
@@ -16,32 +42,44 @@ import numpy as np
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
+# Fraction of bbox width/height to add as margin on each side.
+BBOX_MARGIN = 0.3
 
-def infer(img_path, bbox, checkpoint, config, out_path=None, show=False):
+
+def _crop_with_margin(img, bbox_xyxy):
+    """Expand bbox by BBOX_MARGIN, clamp to image bounds, return crop + origin."""
+    xmin, ymin, xmax, ymax = bbox_xyxy
+    w, h = xmax - xmin, ymax - ymin
+    ih, iw = img.shape[:2]
+
+    cx1 = max(0, int(xmin - w * BBOX_MARGIN))
+    cy1 = max(0, int(ymin - h * BBOX_MARGIN))
+    cx2 = min(iw, int(xmax + w * BBOX_MARGIN))
+    cy2 = min(ih, int(ymax + h * BBOX_MARGIN))
+
+    crop = img[cy1:cy2, cx1:cx2].copy()
+    adjusted = [xmin - cx1, ymin - cy1, xmax - cx1, ymax - cy1]
+    return crop, adjusted, (cx1, cy1)
+
+
+def _run_model(model, img_bgr, bbox_xyxy):
+    """Run MMPose model on a single image + bbox. Returns (4, 2) keypoints."""
+    from mmengine.dataset import default_collate
     import torch
-    from mmpose.apis import init_model
+
+    xmin, ymin, xmax, ymax = bbox_xyxy
+    bbox_xywh = [xmin, ymin, xmax - xmin, ymax - ymin]
+
     from mmpose.datasets.transforms import (
         GetBBoxCenterScale,
         LoadImage,
         PackPoseInputs,
         TopdownAffine,
     )
-    from mmengine.dataset import default_collate
-
-    model = init_model(config, checkpoint, device='cuda:0')
-    model.eval()
-    model.test_cfg = dict(flip_test=False)
-
-    img = cv2.imread(img_path)
-    if img is None:
-        raise FileNotFoundError(f'Cannot read {img_path}')
-
-    xmin, ymin, xmax, ymax = bbox
-    bbox_xywh = [xmin, ymin, xmax - xmin, ymax - ymin]
 
     data_info = dict(
-        img_path=img_path,
-        img=img.copy(),
+        img_path='',
+        img=img_bgr.copy(),
         bbox=np.array(bbox_xywh, dtype=np.float32).reshape(1, 4),
         bbox_score=np.array([1.0], dtype=np.float32).reshape(1, 1),
         keypoints=np.zeros((1, 4, 2), dtype=np.float32),
@@ -52,12 +90,39 @@ def infer(img_path, bbox, checkpoint, config, out_path=None, show=False):
     data = GetBBoxCenterScale()(data)
     data = TopdownAffine(input_size=(192, 256))(data)
     data = PackPoseInputs()(data)
-    data_batch = default_collate([data])
 
     with torch.no_grad():
-        results = model.test_step(data_batch)
+        results = model.test_step(default_collate([data]))
 
-    keypoints = np.array(results[0].pred_instances.keypoints)[0]
+    return np.array(results[0].pred_instances.keypoints)[0]
+
+
+def infer(img, bbox, model, out_path=None, show=False):
+    """Infer car keypoints on an image.
+
+    Args:
+        img: BGR ndarray or path to image file.
+        bbox: [xmin, ymin, xmax, ymax] in original image coordinates.
+        model: loaded MMPose model.
+        out_path: optional path to save visualization.
+        show: whether to display the result.
+
+    Returns:
+        keypoints: (4, 2) ndarray in original image coordinates.
+    """
+    if isinstance(img, str):
+        img = cv2.imread(img)
+        if img is None:
+            raise FileNotFoundError(f'Cannot read {img}')
+
+    xmin, ymin, xmax, ymax = [int(v) for v in bbox]
+
+    # Crop around bbox with margin, infer on the whole crop, map keypoints back.
+    crop, _, (ox, oy) = _crop_with_margin(img, [xmin, ymin, xmax, ymax])
+    ch, cw = crop.shape[:2]
+    keypoints = _run_model(model, crop, [0, 0, cw, ch])
+    keypoints[:, 0] += ox
+    keypoints[:, 1] += oy
 
     labels = ['RF', 'LF', 'LB', 'RB']
     for label, kp in zip(labels, keypoints):
@@ -103,7 +168,13 @@ def main():
     parser.add_argument('--out', default=None, help='Output visualization path')
     parser.add_argument('--show', action='store_true', help='Show result window')
     args = parser.parse_args()
-    infer(args.img, args.bbox, args.checkpoint, args.config, args.out, args.show)
+
+    from mmpose.apis import init_model
+    model = init_model(args.config, args.checkpoint, device='cuda:0')
+    model.eval()
+    model.test_cfg = dict(flip_test=False)
+
+    infer(args.img, args.bbox, model, args.out, args.show)
 
 
 if __name__ == '__main__':
