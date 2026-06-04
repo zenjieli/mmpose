@@ -39,6 +39,9 @@ uv pip install "setuptools<72" --python .venv/bin/python
 # mmpose editable install
 uv pip install -e . --no-build-isolation --python .venv/bin/python
 
+# ONNX export and standalone inference
+uv pip install onnx onnxruntime --python .venv/bin/python
+
 # Apply patches to installed wheels
 .venv/bin/python custom/patches/apply_patches.py
 
