@@ -18,17 +18,13 @@ To match the training distribution we:
 
   1. Crop the image around the detection bbox with 30% margin on each side.
      This produces a ~500px crop where the car fills most of the area,
-     similar to Pascal3D+ training images.
-  2. Pass the *entire crop* as the bbox to the model (bbox=[0,0,cw,ch]).
-     The model's GetBBoxCenterScale + TopdownAffine pipeline then
-     uniformly scales the whole crop to 192x256 (with black borders for
-     aspect-ratio adjustment).
-
-This differs from training where the pipeline receives a tight detection bbox
-and GetBBoxCenterScale's 1.25x padding adds real image context around the car.
-Here the 30% crop margin provides that context upfront, and the 1.25x padding
-extends into zero-filled (black) regions instead.  The model is robust to this
-difference because the car is already at a similar scale to training.
+     similar to Pascal3D+ training images, and provides real image context
+     around the car.
+  2. Pass the *tight detection bbox* (adjusted to crop coordinates) to the
+     model.  The model's GetBBoxCenterScale adds 1.25× padding which extends
+     into the real image context from the margin crop — exactly matching the
+     training schema where the pipeline receives a tight bbox and adds 1.25×
+     padding into surrounding image content.
 
 Predicted keypoints are offset by the crop origin to return coordinates in the
 original image frame.
@@ -117,10 +113,11 @@ def infer(img, bbox, model, out_path=None, show=False):
 
     xmin, ymin, xmax, ymax = [int(v) for v in bbox]
 
-    # Crop around bbox with margin, infer on the whole crop, map keypoints back.
-    crop, _, (ox, oy) = _crop_with_margin(img, [xmin, ymin, xmax, ymax])
-    ch, cw = crop.shape[:2]
-    keypoints = _run_model(model, crop, [0, 0, cw, ch])
+    # Crop around bbox with margin to provide context, then pass the tight
+    # bbox (in crop coordinates) so GetBBoxCenterScale's 1.25× padding extends
+    # into real image content from the margin — matching training exactly.
+    crop, adjusted, (ox, oy) = _crop_with_margin(img, [xmin, ymin, xmax, ymax])
+    keypoints = _run_model(model, crop, adjusted)
     keypoints[:, 0] += ox
     keypoints[:, 1] += oy
 

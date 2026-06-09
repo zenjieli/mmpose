@@ -10,7 +10,9 @@ Preprocessing pipeline
 ----------------------
 1. Crop the image around the detection bbox with 30 % margin (same as
    infer_car_pose.py) to match the Pascal3D+ training distribution.
-2. Treat the full crop as the input region (bbox = whole crop).
+2. Pass the *tight detection bbox* (adjusted to crop coordinates) so that
+   GetBBoxCenterScale's 1.25× padding extends into real image context from
+   the margin crop — matching the training schema exactly.
 3. Compute bbox center / scale (with 1.25× padding, matching GetBBoxCenterScale).
 4. Fix aspect ratio to 192 / 256, compute affine matrix, warp to 192×256.
 5. BGR → RGB, subtract ImageNet mean, divide by std → float32 NCHW blob.
@@ -109,16 +111,19 @@ def _fix_aspect_ratio(scale: np.ndarray, aspect_ratio: float) -> np.ndarray:
 
 # ── preprocessing / postprocessing ───────────────────────────────────────────
 
-def _preprocess(img_bgr: np.ndarray):
-    """Prepare a 192×256 ONNX input blob from a BGR image (the full crop).
+def _preprocess(img_bgr: np.ndarray, bbox_xyxy):
+    """Prepare a 192×256 ONNX input blob from a BGR image (the margin crop).
+
+    Args:
+        img_bgr  : the margin-cropped BGR image.
+        bbox_xyxy: tight detection bbox [x1, y1, x2, y2] in crop coordinates.
 
     Returns:
         blob   : float32 [1, 3, 256, 192] ready for the ONNX session
         center : (2,) bbox center used later for coordinate remapping
         scale  : (2,) aspect-ratio-corrected scale for coordinate remapping
     """
-    ih, iw = img_bgr.shape[:2]
-    center, scale = _bbox_xyxy2cs([0, 0, iw, ih], padding=_BBOX_PADDING)
+    center, scale = _bbox_xyxy2cs(bbox_xyxy, padding=_BBOX_PADDING)
 
     aspect_ratio = _INPUT_W / _INPUT_H
     scale = _fix_aspect_ratio(scale, aspect_ratio)
@@ -181,7 +186,7 @@ def _decode_simcc(simcc_x: np.ndarray,
 # ── crop helper ───────────────────────────────────────────────────────────────
 
 def _crop_with_margin(img: np.ndarray, bbox_xyxy):
-    """Expand bbox by _BBOX_MARGIN, clamp to image, return crop + origin."""
+    """Expand bbox by _BBOX_MARGIN, clamp to image, return crop + adjusted bbox + origin."""
     xmin, ymin, xmax, ymax = bbox_xyxy
     bw, bh = xmax - xmin, ymax - ymin
     ih, iw = img.shape[:2]
@@ -189,7 +194,8 @@ def _crop_with_margin(img: np.ndarray, bbox_xyxy):
     cy1 = max(0, int(ymin - bh * _BBOX_MARGIN))
     cx2 = min(iw, int(xmax + bw * _BBOX_MARGIN))
     cy2 = min(ih, int(ymax + bh * _BBOX_MARGIN))
-    return img[cy1:cy2, cx1:cx2].copy(), (cx1, cy1)
+    adjusted = [xmin - cx1, ymin - cy1, xmax - cx1, ymax - cy1]
+    return img[cy1:cy2, cx1:cx2].copy(), adjusted, (cx1, cy1)
 
 
 # ── public API ────────────────────────────────────────────────────────────────
@@ -222,9 +228,9 @@ def infer(img, bbox, sess: ort.InferenceSession,
             raise FileNotFoundError(f'Cannot read {img!r}')
 
     xmin, ymin, xmax, ymax = [int(v) for v in bbox]
-    crop, (ox, oy) = _crop_with_margin(img, [xmin, ymin, xmax, ymax])
+    crop, adjusted, (ox, oy) = _crop_with_margin(img, [xmin, ymin, xmax, ymax])
 
-    blob, center, scale = _preprocess(crop)
+    blob, center, scale = _preprocess(crop, adjusted)
 
     input_name = sess.get_inputs()[0].name
     simcc_x, simcc_y = sess.run(['simcc_x', 'simcc_y'], {input_name: blob})
